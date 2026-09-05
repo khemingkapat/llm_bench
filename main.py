@@ -3,121 +3,129 @@ import json
 import os
 import sys
 
-from src.benchmark_baseline import run_benchmark as run_baseline
-from src.benchmark_lmcache import run_lmcache_benchmark as run_lmcache
-from src.benchmark_profiling import run_profiling
-from src.benchmark_disaggregation import run_sequential_disaggregation
-from src.benchmark_flexgen import run_flexgen_benchmark as run_flexgen
+from src.core.config import BenchmarkConfig
+from src.core.harness import run_benchmark
+from src.core.registry import get_technique, list_techniques
 
-def parse_contexts(ctx_input):
+
+def parse_contexts(raw) -> list[int]:
+    """Accepts space-separated (argparse nargs='+') or comma-separated input."""
+    joined = ",".join(raw) if isinstance(raw, list) else str(raw)
+    return [int(c) for c in joined.replace(",", " ").split() if c.strip()]
+
+
+def parse_technique_args(raw: list[str]) -> dict:
+    """Parse --technique-args key=val key=val into a dict.
+
+    Values are cast to int or float if possible, otherwise kept as str.
+    This lets you tune technique parameters from the CLI without touching
+    the technique file -- e.g. --technique-args swap_space_gb=8.
+
+    All Technique.__init__ parameters MUST have defaults (zero-arg convention)
+    so the registry can instantiate any technique without required arguments.
+    These overrides are then applied on top of the defaults.
     """
-    Robustly parses context length inputs in multiple formats:
-    - Comma-separated string: "512,1024,2048"
-    - Space-separated items from nargs='+': ["512", "1024", "2048"]
-    - Pre-parsed integer list: [512, 1024, 2048]
-    """
-    if isinstance(ctx_input, list):
-        raw = ",".join(str(item) for item in ctx_input)
-    else:
-        raw = str(ctx_input)
-    
-    cleaned = raw.replace(",", " ").split()
-    return [int(c) for c in cleaned if c.strip()]
+    result = {}
+    for item in raw or []:
+        if "=" not in item:
+            raise argparse.ArgumentTypeError(
+                f"--technique-args items must be key=value, got: {item!r}"
+            )
+        k, v = item.split("=", 1)
+        for cast in (int, float):
+            try:
+                v = cast(v)
+                break
+            except ValueError:
+                pass
+        result[k] = v
+    return result
 
-DEFAULT_OUTPUTS = {
-    "baseline": "results/baseline_phase1.json",
-    "lmcache": "results/lmcache_phase2.json",
-    "profiling": "results/profiler_trace_phase3/trace.json",
-    "disaggregation": "results/disaggregation_phase4.json",
-    "flexgen": "results/flexgen.json",
-}
 
-def main():
-    parser = argparse.ArgumentParser(description="KV Cache Benchmark & Profiling Router")
+def main() -> None:
+    defaults = BenchmarkConfig()
+    available = list_techniques()
+
+    parser = argparse.ArgumentParser(
+        description="Unified KV-cache technique benchmark runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  uv run main.py --technique baseline --model Qwen/Qwen2.5-1.5B --contexts 512 1024 2048
+  uv run main.py --technique flexgen_style --contexts 4096 --technique-args swap_space_gb=8
+  uv run main.py --technique lmcache --contexts 2048 --profile
+  uv run main.py --technique baseline --dry-run   # verify routing without a GPU
+""",
+    )
+    parser.add_argument("--technique", required=True, help=f"one of: {', '.join(available)}")
+    parser.add_argument("--model", default=defaults.model)
+    parser.add_argument("--contexts", nargs="+", default=defaults.contexts)
+    parser.add_argument("--max-tokens", type=int, default=defaults.max_tokens)
+    parser.add_argument("--gpu-utilization", type=float, default=defaults.gpu_utilization)
     parser.add_argument(
-        "--mode",
-        choices=["baseline", "lmcache", "profiling", "disaggregation", "flexgen"],
-        required=True,
-        help="Benchmark mode to run"
+        "--technique-args",
+        nargs="*",
+        metavar="KEY=VAL",
+        help="Override technique __init__ kwargs, e.g. swap_space_gb=8 cpu_offload_gb=4",
     )
     parser.add_argument(
-        "--model",
-        type=str,
-        default="Qwen/Qwen2.5-1.5B",
-        help="HuggingFace model identifier or local path"
+        "--profile",
+        action="store_true",
+        help="Wrap workload in torch.profiler; saves Chrome trace and extracts memcpy stats into results",
     )
     parser.add_argument(
-        "--contexts",
-        nargs="+",
-        default=[512, 1024, 2048, 4096, 8192],
-        help="Context lengths to test (comma-separated e.g. 512,1024 or space-separated)"
+        "--profile-dir",
+        default="results/traces",
+        help="Directory for profiler trace files (default: results/traces)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Skip LLM() construction -- verifies technique registration and routing without a GPU",
     )
     parser.add_argument(
         "--output",
-        type=str,
         default=None,
-        help="Output JSON file path (defaults to results/<mode>_phaseX.json)"
+        help="Output JSON path (default: results/<technique>.json)",
     )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="src/config/lmcache_config.yaml",
-        help="LMCache configuration YAML file path"
-    )
-
     args = parser.parse_args()
 
+    technique_kwargs = parse_technique_args(args.technique_args)
+    technique_cls_instance = get_technique(args.technique, **technique_kwargs)
+
     contexts = parse_contexts(args.contexts)
-
-    # Determine output path according to interface contracts
-    output_file = args.output
-    if not output_file:
-        output_file = DEFAULT_OUTPUTS.get(args.mode, f"results/{args.mode}_results.json")
-
-    # Ensure parent output directory exists
-    output_dir = os.path.dirname(output_file)
+    output_path = args.output or f"results/{args.technique}.json"
+    output_dir = os.path.dirname(output_path)
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
-    if args.mode == "baseline":
-        results = run_baseline(args.model, contexts)
-    elif args.mode == "lmcache":
-        os.environ["LMCACHE_CONFIG_FILE"] = args.config
-        results = run_lmcache(args.model, contexts)
-    elif args.mode == "profiling":
-        os.environ["LMCACHE_CONFIG_FILE"] = args.config
-        results = []
-        for ctx in contexts:
-            results.extend(run_profiling(args.model, ctx))
-    elif args.mode == "disaggregation":
-        results = []
-        for ctx in contexts:
-            results.extend(run_sequential_disaggregation(args.model, ctx))
-    elif args.mode == "flexgen":
-        results = run_flexgen(args.model, contexts)
-    else:
-        raise ValueError(f"Unsupported mode: {args.mode}")
+    run_result = run_benchmark(
+        technique_cls_instance,
+        args.model,
+        contexts,
+        max_tokens=args.max_tokens,
+        gpu_utilization=args.gpu_utilization,
+        profile=args.profile,
+        profile_dir=args.profile_dir,
+        dry_run=args.dry_run,
+    )
 
-    # Standardize top-level JSON structure
-    if isinstance(results, dict) and "results" in results:
-        output_data = results
-    else:
-        output_data = {
-            "model": args.model,
-            "mode": args.mode,
-            "results": results
-        }
-
-    with open(output_file, "w") as f:
-        json.dump(output_data, f, indent=2)
+    with open(output_path, "w") as f:
+        json.dump(run_result.to_dict(), f, indent=2, default=str)
         f.flush()
         os.fsync(f.fileno())
-    
-    print(f"\nSaved {args.mode} benchmark results to {output_file}")
-    
-    # Clean exit to prevent vLLM background thread hangs
+
+    print(f"\nSaved {args.technique} results -> {output_path}")
+
+    if args.dry_run:
+        # Use normal sys.exit in dry-run so CI gets a clean 0 and we don't
+        # swallow real failures. os._exit(0) bypasses Python cleanup and would
+        # mask any exception that happened before this point.
+        sys.exit(0)
+
+    # vLLM spawns background threads that can hang a clean process exit.
     os._exit(0)
+
 
 if __name__ == "__main__":
     main()
-

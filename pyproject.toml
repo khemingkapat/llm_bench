@@ -1,7 +1,7 @@
 [project]
-name = "kv-bench"
+name = "kv-pipeline"
 version = "0.1.0"
-description = "Benchmarking & Reproducing KV Cache Optimization Techniques on Consumer Hardware"
+description = "Unified benchmarking pipeline for KV-cache optimization techniques on consumer GPUs"
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
 dependencies = [
@@ -10,6 +10,7 @@ dependencies = [
     "transformers==4.45.2",
     "accelerate",
     "pynvml",
+    "psutil",        # host RSS measurement (CPU RAM used by offloaded KV cache)
     "matplotlib",
     "pandas",
     "numpy",
